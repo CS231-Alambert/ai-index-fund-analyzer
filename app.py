@@ -1,290 +1,445 @@
+"""
+AI 指数基金分析系统 — Streamlit 交互看板
+
+支持: 场内 ETF / 场外指数基金 / 场外主动基金 / QDII
+双引擎: 技术指标 (70%) + 基本面指标 (30%)
+核心方法: 持仓个股加权合成基金级别数据
+"""
+
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from crawler.fund_crawler import FundCrawler
 from crawler.index_crawler import IndexCrawler
+from analyzer.holdings_engine import HoldingsEngine
 from analyzer.decision_model import DecisionModel
+from analyzer.technical_indicators import TechnicalIndicators
 from cache.sqlite_cache import cache
-from config import APP_CONFIG, EXPORT_CONFIG
+from config import APP_CONFIG, EXPORT_CONFIG, TECHNICAL_INDICATOR_PARAMS, FUND_CONFIG
 from utils.file_utils import ensure_dir, generate_filename
 from utils.logger import logger
 
 
-# 初始化应用
+# ── 初始化 ──────────────────────────────────────────────────
+
 def init_app():
-    """初始化应用"""
     st.set_page_config(
         page_title=APP_CONFIG['title'],
         page_icon='📊',
         layout='wide',
         initial_sidebar_state='expanded'
     )
-    
     st.title(APP_CONFIG['title'])
     st.markdown(APP_CONFIG['description'])
-    
-    # 初始化组件
-    crawler = IndexCrawler()
-    decision_model = DecisionModel()
-    
-    return crawler, decision_model
+
+    return FundCrawler(), HoldingsEngine(), DecisionModel()
 
 
-# 搜索组件
+# ── 侧边栏搜索 ──────────────────────────────────────────────
+
 def search_component():
-    """搜索组件"""
     with st.sidebar:
-        st.header('搜索指数')
-        code = st.text_input(
-            '请输入6位指数代码',
-            value=APP_CONFIG['default_index'],
-            max_chars=6,
-            placeholder='例如：000001'
+        st.header('🔍 搜索基金/指数')
+
+        mode = st.radio(
+            '分析模式',
+            ['📊 基金分析 (持仓加权)', '📈 指数快速分析'],
+            index=0,
         )
-        
-        source = st.selectbox(
-            '数据源',
-            ['default', 'eastmoney'],
-            index=0
-        )
-        
-        search_button = st.button('搜索', type='primary')
-    
-    return code, source, search_button
+
+        if mode.startswith('📊'):
+            code = st.text_input(
+                '基金代码',
+                value='110003',
+                max_chars=6,
+                placeholder='例: 110003 易方达上证50'
+            )
+        else:
+            code = st.text_input(
+                '指数代码',
+                value='000001',
+                max_chars=6,
+                placeholder='例: 000001 上证指数'
+            )
+
+        search_button = st.button('开始分析', type='primary', use_container_width=True)
+
+        st.divider()
+        st.caption("📊 基金代码: 110003 上证50 | 510300 沪深300ETF")
+        st.caption("📈 指数代码: 000001 上证 | 399006 创业板")
+        st.caption("🔧 基本面指标由持仓个股加权计算")
+
+    return mode, code, search_button
 
 
-# 数据展示组件
-def data_display_component(index_data):
-    """数据展示组件"""
-    st.header(f"{index_data['name']} ({index_data['code']}) 实时数据")
-    
-    # 使用三列布局展示关键指标
-    col1, col2, col3 = st.columns(3)
-    
+# ── 基金信息头部 ────────────────────────────────────────────
+
+def fund_header(fund_info, decision_result):
+    """基金名称 + 类型标签 + 综合评分"""
+    category = fund_info.get('category', 'other')
+    label = FUND_CONFIG['type_labels'].get(category, '未知类型')
+
+    color_map = {
+        'etf': '#3b82f6', 'otc_index': '#22c55e',
+        'otc_active': '#f59e0b', 'qdii': '#8b5cf6', 'other': '#6b7280',
+    }
+    color = color_map.get(category, '#6b7280')
+
+    col1, col2 = st.columns([3, 1])
     with col1:
-        st.metric(
-            label="市盈率 (PE)",
-            value=round(index_data['pe'], 2)
+        st.markdown(
+            f"## {fund_info['name']} "
+            f"<span style='font-size:0.5em; color:{color}; border:1px solid {color}; "
+            f"border-radius:6px; padding:2px 8px; margin-left:8px;'>{label}</span>",
+            unsafe_allow_html=True,
         )
-        
-        st.metric(
-            label="净资产收益率 (ROE)",
-            value=f"{round(index_data['roe'], 2)}%"
-        )
-        
-        st.metric(
-            label="换手率",
-            value=f"{round(index_data['turnover'], 2)}%"
-        )
-    
+        st.caption(f"代码: {fund_info['code']} | 类型: {fund_info['type']}")
+
     with col2:
+        suggestion_map = {
+            'strong_buy': '📈 强烈买入',
+            'buy': '👍 买入', 'hold': '🤝 持有',
+            'sell': '👎 卖出', 'strong_sell': '📉 强烈卖出',
+        }
         st.metric(
-            label="主力资金流入量",
-            value=f"{round(index_data['fund_inflow'] / 100000000, 2)} 亿"
+            label="🎯 综合评分",
+            value=f"{decision_result['total_score']:.1f}",
+            delta=suggestion_map.get(decision_result['suggestion'], ''),
         )
-        
-        st.metric(
-            label="主力资金流出量",
-            value=f"{round(index_data['fund_outflow'] / 100000000, 2)} 亿"
-        )
-        
-        st.metric(
-            label="主力资金净变化额",
-            value=f"{round(index_data['fund_net_change'] / 100000000, 2)} 亿"
-        )
-    
-    with col3:
-        # 显示数据源信息
-        st.info(f"数据来源: {index_data['source']}")
-        
-        # 显示更新时间
-        from datetime import datetime
-        st.info(f"更新时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 
-# 历史数据下载组件
-def historical_data_download_component(crawler, code, name):
-    """历史数据下载组件"""
-    st.subheader("历史数据下载")
-    
-    # 获取历史数据
-    historical_data = crawler.get_historical_data(code)
-    
-    if historical_data is not None and not historical_data.empty:
-        # 显示历史数据概览
-        st.write(f"共 {len(historical_data)} 条历史数据")
-        
-        # 生成文件名
-        filename = generate_filename(
-            EXPORT_CONFIG['file_name_pattern'],
-            code,
-            name
-        )
-        
-        # 转换为CSV格式
-        csv = historical_data.to_csv(index=False, encoding=EXPORT_CONFIG['encoding'])
-        
-        # 下载按钮
-        st.download_button(
-            label="下载完整估值数据 (CSV)",
-            data=csv,
-            file_name=filename,
-            mime="text/csv",
-            key=f"download_{code}"
-        )
-        
-        # 显示历史数据图表
-        st.subheader("历史估值走势")
-        
-        # PE走势图
-        fig_pe = px.line(historical_data, x='date', y='pe', title=f'{name} 历史市盈率走势')
-        st.plotly_chart(fig_pe, use_container_width=True)
-        
-        # ROE走势图
-        fig_roe = px.line(historical_data, x='date', y='roe', title=f'{name} 历史净资产收益率走势')
-        st.plotly_chart(fig_roe, use_container_width=True)
-        
-        # 资金流走势图
-        fig_fund = px.line(historical_data, x='date', y='fund_net_change', title=f'{name} 历史资金流走势')
-        st.plotly_chart(fig_fund, use_container_width=True)
+# ── 持仓明细表 ──────────────────────────────────────────────
+
+def holdings_table(decision_result):
+    """展示持仓个股明细"""
+    holdings_detail = decision_result.get('holdings_detail', [])
+    if not holdings_detail:
+        return
+
+    st.subheader("📋 持仓个股明细")
+
+    rows = []
+    for h in holdings_detail:
+        rows.append({
+            '代码': h['stock_code'],
+            '名称': h['stock_name'],
+            '权重(%)': f"{h['weight_pct']:.2f}",
+            'PE': f"{h.get('pe', 0):.1f}",
+            'PB': f"{h.get('pb', 0):.2f}",
+            '换手率(%)': f"{h.get('turnover', 0):.2f}",
+        })
+
+    df = pd.DataFrame(rows)
+
+    # 覆盖信息
+    hs = decision_result.get('holdings_summary', {})
+    if hs.get('is_full'):
+        coverage_text = f"📊 覆盖全部 {hs['used_count']} 只个股, 权重覆盖率 {hs.get('coverage_pct', 0):.1f}%"
     else:
-        st.error("获取历史数据失败")
-
-
-# 决策分析组件
-def decision_analysis_component(decision_result):
-    """决策分析组件"""
-    st.header("决策分析")
-    
-    # 获取建议文本
-    suggestion_text = {
-        'strong_buy': '📈 强烈买入',
-        'buy': '👍 买入',
-        'hold': '🤝 持有',
-        'sell': '👎 卖出',
-        'strong_sell': '📉 强烈卖出'
-    }[decision_result['suggestion']]
-    
-    # 显示综合得分和建议
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.metric(
-            label="综合得分",
-            value=decision_result['total_score'],
-            delta=None
+        coverage_text = (
+            f"📊 前 {hs['used_count']}/{hs['total_count']} 大重仓股, "
+            f"权重覆盖率 {hs.get('coverage_pct', 0):.1f}%"
         )
-    
-    with col2:
-        st.success(suggestion_text, icon="📋")
-    
-    # 显示决策依据
-    st.subheader("决策依据")
-    st.text(decision_result['decision_basis'])
-    
-    # 显示指标权重
-    st.subheader("指标权重")
-    weights_df = pd.DataFrame(
-        list(decision_result['indicator_weights'].items()),
-        columns=['指标', '权重']
-    )
-    weights_df['权重'] = weights_df['权重'] * 100
-    weights_df['权重'] = weights_df['权重'].map('{:.1f}%'.format)
-    
-    st.dataframe(weights_df, use_container_width=True)
-    
-    # 可视化指标得分
-    st.subheader("指标得分分析")
-    
-    # 准备指标得分数据
+    st.caption(coverage_text)
+
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    # 合成数据提示
+    with st.expander("💡 关于合成数据"):
+        st.markdown("""
+        **OHLCV 合成方式**: 逐日对持仓个股的开高低收量按权重加权求和。
+        例如: `基金收盘价[t] = Σ(个股收盘价[t] × 权重%) / Σ(权重%)`
+
+        **基本面加权**: PE、ROE、PB、换手率 均为持仓个股对应指标的加权平均值。
+
+        **适用性**: 技术指标（MA/EMA/VWAP/斐波那契等）在合成 OHLCV 上计算，
+        反映的是"如果你按基金权重构建一个虚拟组合"的技术面特征。
+        """)
+
+
+# ── 技术指标仪表盘 ──────────────────────────────────────────
+
+def technical_dashboard(decision_result):
+    st.header("🔴 技术指标")
     indicators_scores = decision_result['indicators_scores']
+    tech_indicators = {
+        k: v for k, v in indicators_scores.items()
+        if decision_result['indicator_categories'].get(k) == 'technical'
+    }
+
+    rows = [list(tech_indicators.items())[i:i+3] for i in range(0, 6, 3)]
+    for row in rows:
+        cols = st.columns(3)
+        for col, (indicator, info) in zip(cols, row):
+            score = info['score']
+            if score >= 80:
+                color, emoji = "#22c55e", "🟢"
+            elif score >= 60:
+                color, emoji = "#84cc16", "🟡"
+            elif score >= 40:
+                color, emoji = "#eab308", "🟠"
+            elif score >= 20:
+                color, emoji = "#f97316", "🔴"
+            else:
+                color, emoji = "#ef4444", "💀"
+
+            name = {
+                'price_action': '价格行为', 'fibonacci': '斐波那契',
+                'volume': '成交量', 'vwap': 'VWAP均价',
+                'ema': 'EMA', 'ma': 'MA',
+            }.get(indicator, indicator)
+
+            with col:
+                st.markdown(
+                    f"""<div style="border:1px solid #333; border-radius:12px; padding:16px;
+                    text-align:center; background:linear-gradient(135deg,#1a1a2e,#16213e);">
+                    <div style="font-size:0.85rem;color:#888;">{emoji} {name}</div>
+                    <div style="font-size:2.2rem;font-weight:700;color:{color};">{score:.0f}</div>
+                    <div style="font-size:0.75rem;color:#666;">权重 {info['weight']*100:.0f}%</div>
+                    </div>""",
+                    unsafe_allow_html=True,
+                )
+
+
+# ── 类别摘要 ────────────────────────────────────────────────
+
+def category_summary(decision_result):
+    st.header("📊 评分对比")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("🔴 技术得分 (70%)", f"{decision_result.get('technical_score', 0):.1f}")
+    with col2:
+        st.metric("🟢 基本面得分 (30%)", f"{decision_result.get('fundamental_score', 0):.1f}")
+    with col3:
+        st.metric("🎯 综合得分", f"{decision_result['total_score']:.1f}")
+
+
+# ── 技术图表 ────────────────────────────────────────────────
+
+def ohlcv_charts(index_data):
+    ohlcv = index_data.get('ohlcv')
+    if ohlcv is None or ohlcv.empty:
+        st.info("无 OHLCV 数据")
+        return
+    df = ohlcv.copy()
+    params = TECHNICAL_INDICATOR_PARAMS
+
+    # ── 均线系统 ──
+    st.subheader("📈 均线系统 (MA / EMA)")
+    for period in params['ma_periods']:
+        df[f'MA{period}'] = df['close'].rolling(window=period).mean()
+    df['EMA12'] = df['close'].ewm(span=params['ema_short'], adjust=False).mean()
+    df['EMA26'] = df['close'].ewm(span=params['ema_long'], adjust=False).mean()
+
+    fig_ma = go.Figure()
+    fig_ma.add_trace(go.Scatter(x=df.index, y=df['close'], mode='lines',
+        name='价格', line=dict(color='#e0e0e0', width=2)))
+    ma_colors = ['#fbbf24', '#f59e0b', '#ef4444', '#8b5cf6']
+    for period, color in zip(params['ma_periods'], ma_colors):
+        fig_ma.add_trace(go.Scatter(x=df.index, y=df[f'MA{period}'], mode='lines',
+            name=f'MA{period}', line=dict(color=color, width=1.2, dash='dot')))
+    fig_ma.add_trace(go.Scatter(x=df.index, y=df['EMA12'], mode='lines',
+        name='EMA12', line=dict(color='#06b6d4', width=1.5)))
+    fig_ma.add_trace(go.Scatter(x=df.index, y=df['EMA26'], mode='lines',
+        name='EMA26', line=dict(color='#ec4899', width=1.5)))
+    fig_ma.update_layout(height=400, margin=dict(l=0, r=0, t=0, b=0),
+        legend=dict(orientation='h', yanchor='top', y=-0.15),
+        xaxis_rangeslider_visible=False, template='plotly_dark')
+    st.plotly_chart(fig_ma, use_container_width=True)
+
+    # ── 成交量 + VWAP ──
+    st.subheader("📊 成交量 + VWAP")
+    typical_price = (df['high'] + df['low'] + df['close']) / 3
+    df['VWAP'] = (typical_price * df['volume']).cumsum() / df['volume'].cumsum()
+    df['VolMA'] = df['volume'].rolling(window=params['volume_ma_period']).mean()
+
+    fig_vol = make_subplots(rows=2, cols=1, shared_xaxes=True,
+        row_heights=[0.6, 0.4], vertical_spacing=0.05)
+    fig_vol.add_trace(go.Scatter(x=df.index, y=df['close'], mode='lines',
+        name='价格', line=dict(color='#e0e0e0', width=2)), row=1, col=1)
+    fig_vol.add_trace(go.Scatter(x=df.index, y=df['VWAP'], mode='lines',
+        name='VWAP', line=dict(color='#f59e0b', width=2, dash='dash')), row=1, col=1)
+    colors = ['#ef4444' if df['close'].iloc[i] < df['open'].iloc[i] else '#22c55e'
+              for i in range(len(df))]
+    fig_vol.add_trace(go.Bar(x=df.index, y=df['volume'], name='成交量',
+        marker_color=colors, opacity=0.6), row=2, col=1)
+    fig_vol.add_trace(go.Scatter(x=df.index, y=df['VolMA'], mode='lines',
+        name=f'VOL MA{params["volume_ma_period"]}',
+        line=dict(color='#fbbf24', width=1.5)), row=2, col=1)
+    fig_vol.update_layout(height=450, margin=dict(l=0, r=0, t=0, b=0),
+        legend=dict(orientation='h', yanchor='top', y=-0.12),
+        xaxis_rangeslider_visible=False, template='plotly_dark')
+    st.plotly_chart(fig_vol, use_container_width=True)
+
+    # ── 斐波那契 ──
+    st.subheader("🔢 斐波那契回撤位")
+    fib_lookback = params['fib_lookback']
+    lookback_df = df.tail(fib_lookback)
+    swing_high = lookback_df['high'].max()
+    swing_low = lookback_df['low'].min()
+    diff = swing_high - swing_low
+    fig_fib = go.Figure()
+    fig_fib.add_trace(go.Scatter(x=df.index[-fib_lookback:],
+        y=df['close'].tail(fib_lookback), mode='lines',
+        name='价格', line=dict(color='#e0e0e0', width=2)))
+    fib_colors = {0.0: '#22c55e', 0.236: '#84cc16', 0.382: '#fbbf24',
+                  0.5: '#f59e0b', 0.618: '#f97316', 0.786: '#ef4444', 1.0: '#dc2626'}
+    for level in params['fib_levels']:
+        price = swing_low + level * diff
+        fig_fib.add_hline(y=price, line_dash="dash",
+            line_color=fib_colors.get(level, '#888'),
+            annotation_text=f"{level:.3f} ({price:.0f})",
+            annotation_position="right", opacity=0.6)
+    fig_fib.update_layout(height=350, margin=dict(l=0, r=0, t=0, b=0),
+        template='plotly_dark')
+    st.plotly_chart(fig_fib, use_container_width=True)
+
+
+# ── 全指标可视化 ────────────────────────────────────────────
+
+def scores_visualization(decision_result):
+    st.subheader("📊 全指标得分 & 权重")
     scores_data = []
-    
-    for indicator, score_info in indicators_scores.items():
+    for indicator, info in decision_result['indicators_scores'].items():
+        category = decision_result['indicator_categories'].get(indicator, 'unknown')
         scores_data.append({
             '指标': {
-                'pe': '市盈率(PE)',
-                'roe': '净资产收益率(ROE)',
-                'turnover': '换手率',
-                'fund_flow': '主力资金净流入'
-            }[indicator],
-            '得分': score_info['score'],
-            '权重': score_info['weight'] * 100
+                'price_action': '价格行为', 'fibonacci': '斐波那契',
+                'volume': '成交量', 'vwap': 'VWAP', 'ema': 'EMA', 'ma': 'MA',
+                'pe': 'PE', 'roe': 'ROE', 'turnover': '换手率', 'fund_flow': '资金流向',
+            }.get(indicator, indicator),
+            '得分': info['score'], '权重(%)': info['weight'] * 100,
+            '类别': '技术指标' if category == 'technical' else '基本面',
         })
-    
     scores_df = pd.DataFrame(scores_data)
-    
-    # 指标得分条形图
-    fig_scores = px.bar(
-        scores_df,
-        x='指标',
-        y='得分',
-        title='各指标得分',
-        color='指标',
-        height=400
-    )
-    st.plotly_chart(fig_scores, use_container_width=True)
-    
-    # 指标权重饼图
-    fig_weights = px.pie(
-        scores_df,
-        values='权重',
-        names='指标',
-        title='指标权重分布',
-        height=400
-    )
-    st.plotly_chart(fig_weights, use_container_width=True)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        fig_bar = px.bar(scores_df, x='指标', y='得分', color='类别',
+            title='各指标得分', height=400,
+            color_discrete_map={'技术指标': '#ef4444', '基本面': '#22c55e'})
+        fig_bar.update_layout(template='plotly_dark')
+        st.plotly_chart(fig_bar, use_container_width=True)
+    with col2:
+        fig_pie = px.pie(scores_df, values='权重(%)', names='指标',
+            title='权重分布', color='类别', height=400,
+            color_discrete_map={'技术指标': '#ef4444', '基本面': '#22c55e'})
+        fig_pie.update_layout(template='plotly_dark')
+        st.plotly_chart(fig_pie, use_container_width=True)
 
 
-# 主应用逻辑
+# ── 决策依据 ────────────────────────────────────────────────
+
+def decision_basis_component(decision_result):
+    st.header("📋 决策依据")
+    st.text(decision_result['decision_basis'])
+
+
+# ── 主应用 ──────────────────────────────────────────────────
+
 def main():
-    """主应用逻辑"""
-    # 初始化应用
-    crawler, decision_model = init_app()
-    
-    # 获取搜索参数
-    code, source, search_button = search_component()
-    
-    # 搜索逻辑
+    fund_crawler, holdings_engine, decision_model = init_app()
+    mode, code, search_button = search_component()
+
     if search_button or code:
-        # 验证输入
-        if len(code) != 6 or not code.isdigit():
-            st.error("请输入有效的6位数字指数代码")
+        if not code or not code.isdigit() or len(code) < 5:
+            st.error("请输入有效的基金/指数代码（5-6位数字）")
             return
-        
-        # 尝试从缓存获取数据
-        cache_key = f"index_data:{code}:{source}"
-        index_data = cache.get(cache_key)
-        
+
+        with st.spinner('正在获取数据...'):
+            if mode.startswith('📊'):
+                # === 基金分析模式 ===
+                index_data = _load_fund_data(code, fund_crawler, holdings_engine)
+            else:
+                # === 指数快速模式 ===
+                index_data = _load_index_data(code)
+
         if index_data is None:
-            # 显示加载状态
-            with st.spinner('正在获取数据...'):
-                # 获取指数数据
-                index_data = crawler.get_index_data(code)
-                
-                if index_data is not None:
-                    # 缓存数据
-                    cache.set(cache_key, index_data)
-                else:
-                    st.error("获取数据失败，请检查指数代码或数据源")
-                    return
-        
-        # 显示数据
-        data_display_component(index_data)
-        
-        # 进行决策分析
-        decision_result = decision_model.analyze(index_data)
-        
-        # 显示决策分析结果
-        decision_analysis_component(decision_result)
-        
-        # 显示历史数据下载
-        historical_data_download_component(crawler, code, index_data['name'])
+            st.error("获取数据失败，请检查代码或网络连接")
+            return
+
+        # 决策分析
+        with st.spinner('正在分析...'):
+            decision_result = decision_model.analyze(index_data)
+
+        # Fund info for header
+        fund_info = {
+            'code': index_data.get('code', code),
+            'name': index_data.get('name', f'基金{code}'),
+            'type': index_data.get('fund_type_str', ''),
+            'category': index_data.get('fund_category', 'other'),
+        }
+
+        # === 渲染 ===
+        fund_header(fund_info, decision_result)
+        st.divider()
+        holdings_table(decision_result)
+        st.divider()
+        category_summary(decision_result)
+        st.divider()
+        technical_dashboard(decision_result)
+        st.divider()
+        ohlcv_charts(index_data)
+        st.divider()
+        scores_visualization(decision_result)
+        st.divider()
+        decision_basis_component(decision_result)
 
 
-# 运行应用
+def _load_fund_data(code: str, fund_crawler: FundCrawler,
+                    holdings_engine: HoldingsEngine) -> dict | None:
+    """加载基金数据: 获取持仓 → 个股加权合成"""
+    # 1. 基金信息
+    fund_info = fund_crawler.get_fund_info(code)
+    if fund_info is None:
+        return None
+
+    # 2. 持仓明细
+    top_n = FUND_CONFIG['active_top_n']
+    holdings, summary = fund_crawler.get_filtered_holdings(
+        code, fund_info['type'], top_n=top_n
+    )
+
+    if not holdings:
+        st.warning(f"未获取到 {code} 的持仓数据，尝试使用指数快速模式")
+        return _load_index_data(code)
+
+    # 3. 个股加权合成
+    synthetic = holdings_engine.build_synthetic_data(code, holdings)
+    if synthetic is None:
+        return None
+
+    return {
+        'code': code,
+        'name': fund_info['name'],
+        'source': 'holdings_weighted',
+        'fund_type': fund_info['category'],
+        'fund_type_str': fund_info['type'],
+        'fund_category': fund_info['category'],
+        'ohlcv': synthetic['ohlcv'],
+        'pe': synthetic['pe'],
+        'roe': synthetic['roe'],
+        'turnover': synthetic['turnover'],
+        'fund_flow': synthetic['fund_flow'],
+        'fund_inflow': synthetic['fund_inflow'],
+        'fund_outflow': synthetic['fund_outflow'],
+        'fund_net_change': synthetic['fund_net_change'],
+        'holdings_summary': summary,
+        'holdings_detail': synthetic['holdings_detail'],
+    }
+
+
+def _load_index_data(code: str) -> dict | None:
+    """指数快速模式 (保留原有逻辑)"""
+    crawler = IndexCrawler()
+    return crawler.get_index_data(code)
+
+
 if __name__ == '__main__':
     try:
-        logger.info("指数市场分析应用启动")
+        logger.info("AI 指数基金分析系统启动")
         main()
     except Exception as e:
         logger.error(f"应用运行出错: {str(e)}")
