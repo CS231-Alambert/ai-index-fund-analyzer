@@ -263,6 +263,17 @@ class StockCrawler:
                     if fin['bps'] > 0:
                         pb = round(close / fin['bps'], 2)
 
+            # Turnover fallback: 新浪日线自带换手率 (盘后可用)
+            if turnover == defaults['turnover']:
+                try:
+                    sina = self._fetch_sina(self.normalize_code(stock_code))
+                    if sina is not None and not sina.empty and 'turnover' in sina.columns:
+                        t = float(sina['turnover'].iloc[-1])
+                        if t > 0:
+                            turnover = t
+                except Exception:
+                    pass
+
             return {
                 'pe': pe if pe > 0 else defaults['pe'],
                 'pb': pb if pb > 0 else defaults['pb'],
