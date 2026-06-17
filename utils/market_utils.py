@@ -94,3 +94,59 @@ def market_status_text(now: datetime | None = None) -> str:
         return "交易中 (下午盘)"
     else:
         return "已收盘"
+
+
+def trading_day_fraction(now: datetime | None = None) -> float:
+    """返回当日交易时段已过比例。
+
+    0.0 = 9:30 开盘, 0.5 ≈ 12:00, 1.0 = 15:00 收盘
+    非交易日或盘前返回 0.0, 盘后返回 1.0
+
+    用于盘中 volume 外推: estimated_full_day_vol = current_vol / fraction
+    """
+    if now is None:
+        now = datetime.now()
+
+    if not is_trading_day(now):
+        return 1.0 if now.time() >= _AFTERNOON_END else 0.0
+
+    t = now.time()
+
+    # 上午盘总分钟数
+    morning_minutes = (_MORNING_END.hour * 60 + _MORNING_END.minute) - \
+                      (_MORNING_START.hour * 60 + _MORNING_START.minute)
+    afternoon_minutes = (_AFTERNOON_END.hour * 60 + _AFTERNOON_END.minute) - \
+                        (_AFTERNOON_START.hour * 60 + _AFTERNOON_START.minute)
+    total_minutes = morning_minutes + afternoon_minutes
+
+    if t < _MORNING_START:
+        return 0.0
+
+    elif t <= _MORNING_END:
+        elapsed = (t.hour * 60 + t.minute) - \
+                  (_MORNING_START.hour * 60 + _MORNING_START.minute)
+        return elapsed / total_minutes
+
+    elif t < _AFTERNOON_START:
+        return morning_minutes / total_minutes
+
+    elif t <= _AFTERNOON_END:
+        elapsed = morning_minutes + \
+                  (t.hour * 60 + t.minute) - \
+                  (_AFTERNOON_START.hour * 60 + _AFTERNOON_START.minute)
+        return elapsed / total_minutes
+
+    else:
+        return 1.0
+
+
+def candle_completeness_pct(now: datetime | None = None) -> float:
+    """返回当日 K 线完整度百分比。
+
+    盘中 = trading_day_fraction * 100 (如 14:30 ≈ 87%)
+    收盘后 = 100%
+    """
+    frac = trading_day_fraction(now)
+    if frac >= 1.0:
+        return 100.0
+    return round(frac * 100, 1)

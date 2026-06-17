@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from config import TECHNICAL_INDICATOR_PARAMS
 from crawler.stock_crawler import StockCrawler
 from utils.logger import logger
-from utils.market_utils import is_a_market_open
+from utils.market_utils import is_a_market_open, trading_day_fraction
 
 
 class HoldingsEngine:
@@ -275,6 +275,22 @@ class HoldingsEngine:
         # 填补缺失值: forward fill
         for col in ['open', 'high', 'low', 'close', 'volume']:
             df[col] = df[col].replace(0.0, np.nan).ffill().fillna(0)
+
+        # 盘中 volume 外推: 当日成交量仅为部分, 按时间比例外推到全天
+        if is_a_market_open() and len(df) > 0:
+            from datetime import date as date_type
+            last_date = df['date'].iloc[-1]
+            if isinstance(last_date, pd.Timestamp):
+                last_date = last_date.date()
+            today = date_type.today()
+            if last_date == today:
+                frac = trading_day_fraction()
+                if frac > 0.1 and frac < 1.0:
+                    last_vol = df['volume'].iloc[-1]
+                    df.at[df.index[-1], 'volume'] = last_vol / frac
+                    df.at[df.index[-1], '_volume_adjusted'] = True
+                    logger.debug(f"盘中 volume 外推: day_fraction={frac:.2f}, "
+                                 f"raw={last_vol:.0f} → projected={last_vol/frac:.0f}")
 
         return df
 

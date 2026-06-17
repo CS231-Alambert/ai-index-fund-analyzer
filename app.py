@@ -20,6 +20,7 @@ from cache.sqlite_cache import cache
 from config import APP_CONFIG, EXPORT_CONFIG, TECHNICAL_INDICATOR_PARAMS, FUND_CONFIG
 from utils.file_utils import ensure_dir, generate_filename
 from utils.logger import logger
+from utils.market_utils import is_a_market_open, candle_completeness_pct
 
 
 # ── 初始化 ──────────────────────────────────────────────────
@@ -108,6 +109,61 @@ def fund_header(fund_info, decision_result):
             value=f"{decision_result['total_score']:.1f}",
             delta=suggestion_map.get(decision_result['suggestion'], ''),
         )
+
+
+# ── 数据时效性提示条 ──────────────────────────────────────
+
+def data_freshness_bar(decision_result):
+    """数据时效性提示条：持仓季度、K线完整度、PE来源。"""
+    hs = decision_result.get('holdings_summary', {})
+    is_open = is_a_market_open()
+    candle_pct = candle_completeness_pct()
+
+    # 1. 持仓季度 → 距今多少天
+    quarter_str = ""
+    detail = decision_result.get('holdings_detail', [])
+    if detail:
+        q = detail[0].get('quarter', '')
+        quarter_str = q if q else "未知"
+
+    if quarter_str and '季度' in quarter_str:
+        # "2025年1季度股票投资明细" → parse
+        import re, datetime
+        m = re.match(r'(\d{4})年(\d)季度', quarter_str)
+        if m:
+            y, qtr = int(m.group(1)), int(m.group(2))
+            # 季度最后一天
+            q_end_month = qtr * 3
+            q_end = datetime.date(y, q_end_month, 1)
+            # last day of that month
+            if q_end_month == 12:
+                q_end = datetime.date(y, 12, 31)
+            else:
+                q_end = datetime.date(y, q_end_month + 1, 1) - datetime.timedelta(days=1)
+            days_ago = (datetime.date.today() - q_end).days
+            quarter_display = f"{y}年Q{qtr} · 距今 {days_ago} 天"
+        else:
+            quarter_display = quarter_str
+    else:
+        quarter_display = quarter_str if quarter_str else "未获取"
+
+    # 2. K线完整度
+    if not is_open:
+        candle_display = "100% (已收盘)"
+    else:
+        candle_display = f"~{candle_pct:.0f}% (盘中预估)"
+
+    # 3. PE 来源
+    if is_open:
+        pe_source = "实时快照" if decision_result.get('fundamental_score', 0) != 50 else "快照未获取·默认值"
+    else:
+        pe_source = "日线收盘价"
+
+    st.info(
+        f"📅 持仓: **{quarter_display}** | "
+        f"🕯️ K线完整度: **{candle_display}** | "
+        f"📊 PE/PB: **{pe_source}**"
+    )
 
 
 # ── 持仓明细表 ──────────────────────────────────────────────
@@ -374,6 +430,8 @@ def main():
 
         # === 渲染 ===
         fund_header(fund_info, decision_result)
+        st.divider()
+        data_freshness_bar(decision_result)
         st.divider()
         holdings_table(decision_result)
         st.divider()
