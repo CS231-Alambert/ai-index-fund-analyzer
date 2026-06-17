@@ -15,9 +15,14 @@ from utils.logger import logger
 class StockCrawler:
     """个股数据爬虫"""
 
+    # 数据源优先级: 腾讯 → 新浪 → 东方财富 → mock
+    _SOURCES = ['tx', 'sina', 'em']
+
     def __init__(self):
         self.ohlcv_days = TECHNICAL_INDICATOR_PARAMS['ohlcv_days']
-        self._spot_cache: pd.DataFrame | None = None  # 缓存全市场行情
+        self._spot_cache: pd.DataFrame | None = None
+        self._source_failures: dict[str, int] = {}
+        self._source_cooldown: dict[str, float] = {}
 
     # ── 代码规范化 ────────────────────────────────────────────
 
@@ -41,101 +46,104 @@ class StockCrawler:
             else:
                 return f"sz{code}"
 
-    # ── OHLCV 数据 ────────────────────────────────────────────
+    # ── OHLCV 数据 (多源 fallback) ──────────────────────────
 
     def get_ohlcv(self, stock_code: str, days: int | None = None) -> pd.DataFrame | None:
-        """获取个股历史 OHLCV K线数据。
+        """多源 fallback 获取个股 OHLCV。
 
-        Args:
-            stock_code: 股票代码 (如 '600519')
-            days: 获取天数
-
-        Returns:
-            DataFrame with columns: date, open, high, low, close, volume
+        优先级: 腾讯(tx) → 新浪(sina) → 东方财富(em) → mock
+        连续失败 3 次自动冷却 60s, 避免反复撞限流墙。
         """
         if days is None:
             days = self.ohlcv_days
 
         import time
-        time.sleep(0.2)  # 限速
+        time.sleep(0.2)
 
-        try:
-            import akshare as ak
+        symbol = self.normalize_code(stock_code)
+        end_date = pd.Timestamp.now().strftime('%Y%m%d')
+        start_date = (pd.Timestamp.now() - pd.Timedelta(days=days * 2)).strftime('%Y%m%d')
 
-            symbol = self.normalize_code(stock_code)
-            logger.debug(f"获取个股 OHLCV (腾讯源): {symbol}")
+        for source in self._SOURCES:
+            if self._is_source_cooling(source):
+                continue
 
-            # 计算起止日期
-            end_date = pd.Timestamp.now().strftime('%Y%m%d')
-            start_date = (pd.Timestamp.now() - pd.Timedelta(days=days * 2)).strftime('%Y%m%d')
-
-            # 主源: 腾讯 (可靠性更高)
             try:
-                df = ak.stock_zh_a_hist_tx(
-                    symbol=symbol,
-                    start_date=start_date,
-                    end_date=end_date,
-                )
-            except Exception:
-                # Fallback: 东方财富
-                df = ak.stock_zh_a_hist(
-                    symbol=symbol,
-                    period='daily',
-                    start_date=start_date,
-                    end_date=end_date,
-                    adjust='qfq',
-                )
+                df = None
+                if source == 'tx':
+                    df = self._fetch_tx(symbol, start_date, end_date)
+                elif source == 'sina':
+                    df = self._fetch_sina(symbol)
+                elif source == 'em':
+                    df = self._fetch_em(symbol, start_date, end_date)
 
-            if df is None or df.empty:
-                logger.warning(f"个股 OHLCV 返回空: {stock_code}")
-                return None
+                if df is not None and not df.empty:
+                    df = self._normalize_ohlcv(df, stock_code)
+                    df = df.tail(days).reset_index(drop=True)
+                    self._source_failures[source] = 0
+                    logger.debug(f"OHLCV 源={source} {stock_code} {len(df)}条")
+                    return df
+            except Exception as e:
+                logger.debug(f"源 {source} 失败: {stock_code}, {e}")
 
-            # 标准化列名 (腾讯源: date/open/close/high/low/amount)
-            col_map = {
-                '日期': 'date', '开盘': 'open', '最高': 'high',
-                '最低': 'low', '收盘': 'close', '成交量': 'volume',
-                '成交额': 'amount',
-                'date': 'date', 'open': 'open', 'high': 'high',
-                'low': 'low', 'close': 'close', 'volume': 'volume',
-                'amount': 'amount',
-            }
-            df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+            self._source_failures[source] = self._source_failures.get(source, 0) + 1
+            if self._source_failures[source] >= 3:
+                self._source_cooldown[source] = time.time() + 60
+                logger.warning(f"源 {source} 连续失败{self._source_failures[source]}次, 冷却60s")
 
-            # 腾讯源返回 amount (成交额) 而非 volume, 合成 volume
-            if 'amount' in df.columns and 'volume' not in df.columns:
-                df['volume'] = df['amount'] / df['close'].replace(0, 1)
+        return self._generate_mock_ohlcv(stock_code, days)
 
-            # 确保所有 OHLCV 列存在
-            for col, fallback in [('open', 'close'), ('high', 'close'), ('low', 'close'),
-                                   ('close', None), ('volume', None)]:
-                if col not in df.columns:
-                    if fallback and fallback in df.columns:
-                        df[col] = df[fallback]
-                    elif col == 'volume':
-                        df[col] = 1e8
-                    else:
-                        df[col] = df.iloc[:, 1:].mean(axis=1)  # fallback: mean of other cols
+    def _is_source_cooling(self, source: str) -> bool:
+        import time
+        return time.time() < self._source_cooldown.get(source, 0)
 
-            # 保持标准列
-            keep_cols = ['date', 'open', 'high', 'low', 'close', 'volume']
-            df = df[[c for c in keep_cols if c in df.columns]]
+    # ── 各数据源 ──
 
-            # 取最近 N 天
-            df = df.tail(days).reset_index(drop=True)
+    def _fetch_tx(self, symbol: str, start: str, end: str) -> pd.DataFrame:
+        import akshare as ak
+        return ak.stock_zh_a_hist_tx(symbol=symbol, start_date=start, end_date=end)
 
-            # 确保数值类型
-            for col in ['open', 'high', 'low', 'close', 'volume']:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+    def _fetch_sina(self, symbol: str) -> pd.DataFrame:
+        import akshare as ak
+        return ak.stock_zh_a_daily(symbol=symbol, adjust='qfq')
 
-            return df
+    def _fetch_em(self, symbol: str, start: str, end: str) -> pd.DataFrame:
+        import akshare as ak
+        return ak.stock_zh_a_hist(symbol=symbol, period='daily',
+                                   start_date=start, end_date=end, adjust='qfq')
 
-        except ImportError:
-            logger.warning("akshare 未安装，无法获取个股 OHLCV")
-            return self._generate_mock_ohlcv(stock_code, days)
-        except Exception as e:
-            logger.error(f"获取个股 OHLCV 失败: {stock_code}, {e}")
-            return self._generate_mock_ohlcv(stock_code, days)
+    # ── 列标准化 ──
+
+    def _normalize_ohlcv(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
+        col_map = {
+            '日期': 'date', '开盘': 'open', '最高': 'high',
+            '最低': 'low', '收盘': 'close', '成交量': 'volume', '成交额': 'amount',
+            'date': 'date', 'open': 'open', 'high': 'high',
+            'low': 'low', 'close': 'close', 'volume': 'volume', 'amount': 'amount',
+        }
+        df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+
+        if 'amount' in df.columns and 'volume' not in df.columns:
+            df['volume'] = df['amount'] / df['close'].replace(0, 1)
+
+        for col, fallback in [('open', 'close'), ('high', 'close'), ('low', 'close'),
+                               ('close', None), ('volume', None)]:
+            if col not in df.columns:
+                if fallback and fallback in df.columns:
+                    df[col] = df[fallback]
+                elif col == 'volume':
+                    df[col] = 1e8
+                else:
+                    df[col] = df.iloc[:, 1:].mean(axis=1)
+
+        keep = ['date', 'open', 'high', 'low', 'close', 'volume']
+        df = df[[c for c in keep if c in df.columns]]
+
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+
+        return df
 
     def _generate_mock_ohlcv(self, stock_code: str, days: int) -> pd.DataFrame:
         """生成模拟 OHLCV (fallback)"""
