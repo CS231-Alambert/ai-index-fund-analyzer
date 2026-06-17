@@ -48,8 +48,10 @@ class DecisionModel:
         # 计算各指标加权得分
         indicators_scores = self._calculate_indicators_scores(enriched_data)
 
-        # 计算综合得分
-        total_score = self._calculate_total_score(indicators_scores)
+        # 计算综合得分 (含覆盖率折扣)
+        total_score = self._calculate_total_score(
+            indicators_scores, holdings_summary=index_data.get('holdings_summary')
+        )
 
         # 按类别计算得分
         tech_total = sum(
@@ -97,6 +99,7 @@ class DecisionModel:
             'indicator_categories': {k: v['category'] for k, v in self.indicators_config.items()},
             'holdings_summary': holdings_summary,
             'holdings_detail': holdings_detail,
+            'coverage_confidence': min(1.0, holdings_summary.get('coverage_pct', 100) / 100.0) if holdings_summary else 1.0,
         }
 
         logger.info(
@@ -206,8 +209,8 @@ class DecisionModel:
 
     # ── 综合得分类别判定 ────────────────────────────────────
 
-    def _calculate_total_score(self, indicators_scores):
-        """计算综合得分 (0-100)"""
+    def _calculate_total_score(self, indicators_scores, holdings_summary=None):
+        """计算综合得分 (0-100), 低覆盖率时回归中性。"""
         total_weighted_score = sum(
             info['weighted_score'] for info in indicators_scores.values()
         )
@@ -219,11 +222,25 @@ class DecisionModel:
             logger.warning(
                 f"指标权重总和不等于1.0，实际值: {total_weight}，将进行归一化处理"
             )
-            total_score = total_weighted_score / total_weight if total_weight > 0 else 50
+            raw = total_weighted_score / total_weight if total_weight > 0 else 50
         else:
-            total_score = total_weighted_score
+            raw = total_weighted_score
 
-        return round(max(0, min(100, total_score)), 2)
+        raw = max(0, min(100, raw))
+
+        # 覆盖率置信度折扣: 低覆盖 → 回归中性 (50)
+        if holdings_summary:
+            coverage = holdings_summary.get('coverage_pct', 100) / 100.0
+            confidence = min(1.0, coverage)
+            adjusted = 50 + (raw - 50) * confidence
+            if confidence < 0.95:
+                logger.info(
+                    f"覆盖率折扣: raw={raw:.1f}, coverage={coverage:.1%}, "
+                    f"adjusted={adjusted:.1f}"
+                )
+            return round(adjusted, 2)
+
+        return round(raw, 2)
 
     def _determine_suggestion(self, total_score):
         """根据综合得分确定建议等级"""
