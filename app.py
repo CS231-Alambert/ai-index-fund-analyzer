@@ -10,6 +10,14 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import plotly.io as pio
+
+# 中文字体 (Noto Sans CJK SC)
+_CJK_FONT = "Noto Sans CJK SC, Microsoft YaHei, SimHei, sans-serif"
+pio.templates["cjk"] = pio.templates["plotly_dark"].update(
+    font=dict(family=_CJK_FONT)
+)
+pio.templates.default = "cjk"
 from plotly.subplots import make_subplots
 from crawler.fund_crawler import FundCrawler
 from crawler.index_crawler import IndexCrawler
@@ -302,7 +310,7 @@ def ohlcv_charts(index_data):
         name='EMA26', line=dict(color='#ec4899', width=1.5)))
     fig_ma.update_layout(height=400, margin=dict(l=0, r=0, t=0, b=0),
         legend=dict(orientation='h', yanchor='top', y=-0.15),
-        xaxis_rangeslider_visible=False, template='plotly_dark')
+        xaxis_rangeslider_visible=False, template='cjk')
     st.plotly_chart(fig_ma, use_container_width=True)
 
     # ── 成交量 + VWAP ──
@@ -326,7 +334,7 @@ def ohlcv_charts(index_data):
         line=dict(color='#fbbf24', width=1.5)), row=2, col=1)
     fig_vol.update_layout(height=450, margin=dict(l=0, r=0, t=0, b=0),
         legend=dict(orientation='h', yanchor='top', y=-0.12),
-        xaxis_rangeslider_visible=False, template='plotly_dark')
+        xaxis_rangeslider_visible=False, template='cjk')
     st.plotly_chart(fig_vol, use_container_width=True)
 
     # ── 斐波那契 ──
@@ -349,7 +357,7 @@ def ohlcv_charts(index_data):
             annotation_text=f"{level:.3f} ({price:.0f})",
             annotation_position="right", opacity=0.6)
     fig_fib.update_layout(height=350, margin=dict(l=0, r=0, t=0, b=0),
-        template='plotly_dark')
+        template='cjk')
     st.plotly_chart(fig_fib, use_container_width=True)
 
 
@@ -376,13 +384,13 @@ def scores_visualization(decision_result):
         fig_bar = px.bar(scores_df, x='指标', y='得分', color='类别',
             title='各指标得分', height=400,
             color_discrete_map={'技术指标': '#ef4444', '基本面': '#22c55e'})
-        fig_bar.update_layout(template='plotly_dark')
+        fig_bar.update_layout(template='cjk')
         st.plotly_chart(fig_bar, use_container_width=True)
     with col2:
         fig_pie = px.pie(scores_df, values='权重(%)', names='指标',
             title='权重分布', color='类别', height=400,
             color_discrete_map={'技术指标': '#ef4444', '基本面': '#22c55e'})
-        fig_pie.update_layout(template='plotly_dark')
+        fig_pie.update_layout(template='cjk')
         st.plotly_chart(fig_pie, use_container_width=True)
 
 
