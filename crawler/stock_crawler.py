@@ -23,6 +23,7 @@ class StockCrawler:
         self._spot_cache: pd.DataFrame | None = None
         self._source_failures: dict[str, int] = {}
         self._source_cooldown: dict[str, float] = {}
+        self._financial_cache: dict[str, dict] = {}
 
     # ── 代码规范化 ────────────────────────────────────────────
 
@@ -170,13 +171,9 @@ class StockCrawler:
     # ── 基本面数据 ────────────────────────────────────────────
 
     def _get_spot_cache(self) -> pd.DataFrame | None:
-        """获取全市场实时行情 (缓存, 避免重复调用 API)。"""
         if self._spot_cache is not None:
             return self._spot_cache
-
-        import time
-        time.sleep(1.0)  # 限速: 避免 akshare 并发限流
-
+        import time; time.sleep(1.0)
         try:
             import akshare as ak
             df = ak.stock_zh_a_spot_em()
@@ -184,112 +181,146 @@ class StockCrawler:
                 self._spot_cache = df
                 return df
         except Exception as e:
-            logger.warning(f"获取全市场行情失败: {e}")
-
+            logger.debug(f"全市场行情不可用: {e}")
         return None
+
+    def _get_financial_data(self, stock_code: str) -> dict:
+        """从财报获取个股 ROE/EPS/PB (不依赖实时API, 盘后可用)。"""
+        if stock_code in self._financial_cache:
+            return self._financial_cache[stock_code]
+
+        import time; time.sleep(0.3)
+        try:
+            import akshare as ak
+            # 注意: 此API要原始代码 '600519', 不是 'sh600519'
+            df = ak.stock_financial_analysis_indicator(
+                symbol=str(stock_code).strip(), start_year='2025')
+            if df is not None and not df.empty:
+                latest = df.iloc[-1]
+                data = {
+                    'roe': float(latest.get('加权净资产收益率(%)', 10) or 10),
+                    'eps': float(latest.get('摊薄每股收益(元)', 0) or 0),
+                    'bps': float(latest.get('每股净资产_调整前(元)', 0) or 0),
+                    'pb_fin': float(latest.get('市净率', 0) or 0),
+                }
+                self._financial_cache[stock_code] = data
+                return data
+        except Exception as e:
+            logger.debug(f"财报数据获取失败: {stock_code}, {e}")
+
+        self._financial_cache[stock_code] = {}
+        return {}
 
     def get_fundamentals(self, stock_code: str) -> dict:
         """获取个股基本面估值数据。
 
-        使用全市场实时行情快照 (stock_zh_a_spot_em)，一次拉取全量数据
-        后按代码查找，避免逐个 API 调用导致限流。
-
-        Returns:
-            {pe, pb, roe, turnover}
+        盘中: spot 快照 (实时 PE/PB) + 财报 ROE
+        盘后: 财报推算 PE/PB + 财报 ROE
         """
         defaults = {'pe': 15.0, 'pb': 2.0, 'roe': 10.0, 'turnover': 2.0}
 
         try:
-            df = self._get_spot_cache()
-            if df is None:
-                return defaults
+            fin = self._get_financial_data(stock_code)
+            spot = self._get_spot_cache()
 
-            # 列名兼容: 东方财富接口可能返回中文列名
-            code_col = None
-            for col in ['代码', 'code', '股票代码']:
-                if col in df.columns:
-                    code_col = col
-                    break
+            pe = defaults['pe']
+            pb = defaults['pb']
+            turnover = defaults['turnover']
+            roe = fin.get('roe', defaults['roe'])
 
-            if code_col is None:
-                logger.warning(f"全市场行情中无股票代码列")
-                return defaults
+            # PE/PB: 盘中从 spot, 盘后从财报推算
+            if spot is not None:
+                code_col = next((c for c in ['代码','code','股票代码'] if c in spot.columns), None)
+                if code_col:
+                    matched = spot[spot[code_col].astype(str).str.strip() == str(stock_code).strip()]
+                    if not matched.empty:
+                        row = matched.iloc[0]
+                        for col in ['市盈率-动态','动态市盈率']:
+                            v = row.get(col); v = float(v) if v and float(v) > 0 else 0
+                            if v > 0: pe = v; break
+                        for col in ['市净率']:
+                            v = row.get(col); v = float(v) if v and float(v) > 0 else 0
+                            if v > 0: pb = v; break
+                        for col in ['换手率']:
+                            v = row.get(col); v = float(v) if v and float(v) > 0 else 0
+                            if v > 0: turnover = v; break
 
-            matched = df[df[code_col].astype(str).str.strip() == str(stock_code).strip()]
-            if matched.empty:
-                logger.debug(f"全市场行情中未找到: {stock_code}")
-                return defaults
+            # 盘后 fallback: PE = close / (EPS × 4 annualized)
+            if pe == defaults['pe'] and fin.get('eps', 0) > 0:
+                import time
+                ohlcv = self.get_ohlcv(stock_code, days=5)
+                if ohlcv is not None and len(ohlcv) > 0:
+                    close = ohlcv['close'].iloc[-1]
+                    eps_annual = fin['eps'] * 4  # 季报 EPS × 4 = 年化
+                    if eps_annual > 0:
+                        pe = round(close / eps_annual, 1)
 
-            row = matched.iloc[0]
-
-            # PE (市盈率-动态)
-            pe = 0.0
-            for col in ['市盈率-动态', '动态市盈率', 'PE']:
-                if col in df.columns:
-                    val = row.get(col)
-                    if val and float(val) > 0:
-                        pe = float(val)
-                        break
-
-            # PB (市净率)
-            pb = 0.0
-            for col in ['市净率', 'PB']:
-                if col in df.columns:
-                    val = row.get(col)
-                    if val and float(val) > 0:
-                        pb = float(val)
-                        break
-
-            # 换手率
-            turnover = 0.0
-            for col in ['换手率', 'turnover']:
-                if col in df.columns:
-                    val = row.get(col)
-                    if val and float(val) > 0:
-                        turnover = float(val)
-                        break
+            # PB fallback: close / bps
+            if pb == defaults['pb'] and fin.get('bps', 0) > 0:
+                ohlcv = self.get_ohlcv(stock_code, days=5)
+                if ohlcv is not None and len(ohlcv) > 0:
+                    close = ohlcv['close'].iloc[-1]
+                    if fin['bps'] > 0:
+                        pb = round(close / fin['bps'], 2)
 
             return {
                 'pe': pe if pe > 0 else defaults['pe'],
                 'pb': pb if pb > 0 else defaults['pb'],
-                'roe': defaults['roe'],  # 实时行情无ROE, 用默认值
+                'roe': roe if roe > 0 else defaults['roe'],
                 'turnover': turnover if turnover > 0 else defaults['turnover'],
             }
 
-        except ImportError:
-            logger.debug("akshare 不可用，返回默认基本面")
         except Exception as e:
             logger.warning(f"获取个股基本面失败: {stock_code}, {e}")
-
         return defaults
 
-    # ── 资金流向 ──────────────────────────────────────────────
+    # ── 资金流向 (Money Flow) ──────────────────────────────
 
-    def get_fund_flow(self, stock_code: str, days: int = 5) -> float:
-        """获取个股近 N 日主力资金净流入 (万元)。
+    def get_fund_flow(self, stock_code: str, days: int = 5,
+                      ohlcv: pd.DataFrame | None = None) -> float:
+        """个股资金流向 (万元)。
 
-        Returns:
-            净流入金额 (万元), 正=流入, 负=流出
+        优先使用外部 API, 不可用时从 OHLCV 计算 Money Flow:
+          TP = (H+L+C)/3,  Raw MF = TP × Vol
+          近 N 日净 MF = Σ(MF | close↑) - Σ(MF | close↓)
         """
+        # 1. 尝试外部 API
         try:
             import akshare as ak
-
             df = ak.stock_individual_fund_flow(
-                stock=str(stock_code).strip(), market='sh'
-                if stock_code.startswith(('60', '68')) else 'sz'
-            )
-
+                stock=str(stock_code).strip(),
+                market='sh' if stock_code.startswith(('60','68')) else 'sz')
             if df is not None and not df.empty:
                 recent = df.tail(days)
-                if '主力净流入' in recent.columns:
-                    return float(recent['主力净流入'].sum())
-                elif '主力净流入-净额' in recent.columns:
-                    return float(recent['主力净流入-净额'].sum())
+                for col in ['主力净流入','主力净流入-净额']:
+                    if col in recent.columns:
+                        return float(recent[col].sum())
+        except Exception:
+            pass
 
-            return 0.0
+        # 2. Money Flow 从 OHLCV 推算
+        if ohlcv is not None and len(ohlcv) >= max(2, days):
+            return self._compute_money_flow(ohlcv, days)
 
-        except ImportError:
-            return 0.0
-        except Exception as e:
-            logger.debug(f"获取个股资金流向失败: {stock_code}, {e}")
-            return 0.0
+        # 3. 尝试获取 OHLCV
+        try:
+            df = self.get_ohlcv(stock_code, days=max(10, days * 2))
+            if df is not None and len(df) >= max(2, days):
+                return self._compute_money_flow(df, days)
+        except Exception:
+            pass
+
+        return 0.0
+
+    def _compute_money_flow(self, df: pd.DataFrame, days: int = 5) -> float:
+        """基于 OHLCV 计算 Money Flow (万元)。"""
+        recent = df.tail(days + 1)
+        tp = (recent['high'] + recent['low'] + recent['close']) / 3
+        mf = tp * recent['volume']
+        net_mf = 0.0
+        for i in range(1, len(recent)):
+            if recent['close'].iloc[i] > recent['close'].iloc[i - 1]:
+                net_mf += mf.iloc[i]
+            else:
+                net_mf -= mf.iloc[i]
+        return round(net_mf / 10000, 2)  # 转万元

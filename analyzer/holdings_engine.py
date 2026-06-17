@@ -174,7 +174,7 @@ class HoldingsEngine:
             stock_code = h['stock_code']
             try:
                 ohlcv = self.stock_crawler.get_ohlcv(stock_code, self.ohlcv_days)
-                fund_flow = self.stock_crawler.get_fund_flow(stock_code)
+                fund_flow = self.stock_crawler.get_fund_flow(stock_code, ohlcv=ohlcv)
 
                 # 从 spot 快照取 PE/PB (一次 API 调用已获取)
                 spot_data = spot.get(stock_code, {})
